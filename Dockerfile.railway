@@ -16,6 +16,10 @@ RUN uv sync --frozen --no-dev
 # App code
 COPY backend/ ./
 
+# Runtime i18n assets live at the repo root; locale.py resolves them at ../../../locales
+# (i.e. /app/locales relative to /app/backend/app/utils). Copy them in or the app crashes on import.
+COPY locales/ /app/locales/
+
 ENV FLASK_HOST=0.0.0.0
 EXPOSE 5001
 
