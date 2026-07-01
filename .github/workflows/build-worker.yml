@@ -28,6 +28,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # GHCR requires the repository path to be lowercase; github.repository_owner keeps the
+      # original casing (Tomi200208), which fails tag validation. Lowercase it explicitly.
+      - name: Lowercase owner
+        id: owner
+        run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
       - name: Build & push lean worker image
         uses: docker/build-push-action@v5
         with:
@@ -35,4 +40,4 @@ jobs:
           file: ./Dockerfile.railway
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/scenario-worker:latest
+            ghcr.io/${{ steps.owner.outputs.lc }}/scenario-worker:latest
