@@ -1,0 +1,38 @@
+name: Build ScenarioPilot worker image
+
+# Builds the lean backend-only worker image (Dockerfile.railway) on GitHub's runners — which have
+# far more build resources than a hosting free tier — and pushes it to GHCR. Then any host just
+# PULLS the prebuilt image (no build limit).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'Dockerfile.railway'
+      - '.github/workflows/build-worker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push lean worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.railway
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/scenario-worker:latest
