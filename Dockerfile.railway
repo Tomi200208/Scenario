@@ -1,0 +1,23 @@
+# Lean backend-only image for the ScenarioPilot MiroFish worker.
+# The worker needs ONLY the Flask backend + the /sp/runs adapter — not the frontend or Node — so this
+# skips the Node install + two npm installs (the heavy steps that likely tripped the Railway build).
+# Railway: Settings -> Build -> Dockerfile Path: Dockerfile.railway
+FROM python:3.11-slim
+
+# uv for fast, locked installs
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /bin/
+
+WORKDIR /app/backend
+
+# Locked deps first (layer cache)
+COPY backend/pyproject.toml backend/uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# App code
+COPY backend/ ./
+
+ENV FLASK_HOST=0.0.0.0
+EXPOSE 5001
+
+# Bind to Railway's $PORT (fallback 5001). The /sp/runs adapter calls MiroFish on the same port.
+CMD ["sh", "-c", "FLASK_PORT=${PORT:-5001} uv run python run.py"]

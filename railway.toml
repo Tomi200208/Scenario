@@ -1,0 +1,8 @@
+# Railway build config for the ScenarioPilot MiroFish worker.
+# Uses the lean backend-only image (Dockerfile.railway) so the build fits Railway limits.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.railway"
+
+[deploy]
+restartPolicyType = "on_failure"
