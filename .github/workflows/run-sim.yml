@@ -1,0 +1,204 @@
+name: MiroFish on-demand run
+
+on:
+  repository_dispatch:
+    types: [mirofish-run]
+
+concurrency:
+  group: mirofish-${{ github.event.client_payload.scenarioPilotRunId }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    if: ${{ github.event.client_payload.scenarioPilotRunId != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUN_ID: ${{ github.event.client_payload.scenarioPilotRunId }}
+      PROJECT_ID: ${{ github.event.client_payload.projectId }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      MIROFISH_WORKER_TOKEN: ${{ secrets.MIROFISH_WORKER_TOKEN }}
+      MIROFISH_CALLBACK_TOKEN: ${{ secrets.MIROFISH_CALLBACK_TOKEN }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      ZEP_API_KEY: ${{ secrets.ZEP_API_KEY }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://api.openai.com/v1' }}
+      LLM_MODEL_NAME: ${{ vars.LLM_MODEL_NAME || 'gpt-4o-mini' }}
+      OASIS_DEFAULT_MAX_ROUNDS: ${{ vars.OASIS_DEFAULT_MAX_ROUNDS || '10' }}
+
+    steps:
+      - name: Validate dispatch and secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in \
+            SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
+            MIROFISH_WORKER_TOKEN MIROFISH_CALLBACK_TOKEN \
+            LLM_API_KEY ZEP_API_KEY; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required Actions secret $name is not configured."
+              exit 1
+            fi
+          done
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
+          if [[ ! "$RUN_ID" =~ $uuid ]] || [[ ! "$PROJECT_ID" =~ $uuid ]]; then
+            echo "::error::repository_dispatch must contain valid run and project UUIDs."
+            exit 1
+          fi
+
+      - name: Start the worker container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull ghcr.io/tomi200208/scenario-worker:latest
+          docker run -d --name miro -p 127.0.0.1:5001:5001 \
+            -e PORT=5001 \
+            -e FLASK_HOST=0.0.0.0 \
+            -e FLASK_DEBUG=false \
+            -e MIROFISH_WORKER_TOKEN \
+            -e MIROFISH_CALLBACK_TOKEN \
+            -e LLM_API_KEY \
+            -e LLM_BASE_URL \
+            -e LLM_MODEL_NAME \
+            -e ZEP_API_KEY \
+            -e OASIS_DEFAULT_MAX_ROUNDS \
+            ghcr.io/tomi200208/scenario-worker:latest
+
+      - name: Wait for the worker to be ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl --silent --show-error --fail http://127.0.0.1:5001/sp/health >/dev/null; then
+              exit 0
+            fi
+            if ! docker inspect --format '{{.State.Running}}' miro | grep -qx true; then
+              echo "::error::MiroFish worker container stopped before becoming ready."
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "::error::MiroFish worker did not become ready within 60 seconds."
+          exit 1
+
+      - name: Fetch the staged seed bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_file="$RUNNER_TEMP/mirofish-run-input.json"
+          curl --silent --show-error --fail-with-body --get \
+            "$SUPABASE_URL/rest/v1/mirofish_runs" \
+            --data-urlencode "id=eq.$RUN_ID" \
+            --data-urlencode "project_id=eq.$PROJECT_ID" \
+            --data-urlencode "select=project_id,seed_bundle" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            --output "$input_file"
+          if [[ "$(jq 'length' "$input_file")" != "1" ]]; then
+            echo "::error::The dispatched MiroFish run input was not found."
+            exit 1
+          fi
+          callback_url="${SUPABASE_URL%/}/functions/v1/mirofish-notify"
+          jq --exit-status \
+            --arg run_id "$RUN_ID" \
+            --arg project_id "$PROJECT_ID" \
+            --arg callback_url "$callback_url" \
+            --arg callback_token "$MIROFISH_CALLBACK_TOKEN" \
+            '{
+              scenarioPilotRunId: $run_id,
+              projectId: $project_id,
+              seedBundle: .[0].seed_bundle,
+              callback: {url: $callback_url, token: $callback_token}
+            }' "$input_file" >"$RUNNER_TEMP/mirofish-worker-payload.json"
+          chmod 600 "$RUNNER_TEMP/mirofish-worker-payload.json"
+
+      - name: Dispatch the run to the worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          response_file="$RUNNER_TEMP/mirofish-worker-response.json"
+          http_status="$(curl --silent --show-error \
+            --output "$response_file" --write-out '%{http_code}' \
+            -X POST http://127.0.0.1:5001/sp/runs \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $MIROFISH_WORKER_TOKEN" \
+            --data-binary "@$RUNNER_TEMP/mirofish-worker-payload.json")"
+          if [[ "$http_status" != "202" ]]; then
+            echo "::error::MiroFish worker rejected the run with HTTP $http_status."
+            exit 1
+          fi
+          jq --exit-status --arg run_id "$RUN_ID" '.run_id == $run_id' "$response_file" >/dev/null
+
+      - name: Wait for the run to finish
+        id: poll
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 165); do
+            if response="$(curl --silent --show-error --fail --get \
+              "$SUPABASE_URL/rest/v1/mirofish_runs" \
+              --data-urlencode "id=eq.$RUN_ID" \
+              --data-urlencode "select=status" \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY")"; then
+              status="$(jq -r 'if length == 1 then .[0].status // empty else empty end' <<<"$response")"
+              echo "MiroFish run status: ${status:-unavailable}"
+              case "$status" in
+                completed|failed|cancelled)
+                  echo "status=$status" >>"$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+            else
+              echo "Supabase status check failed; retrying ($attempt/165)."
+            fi
+            sleep 10
+          done
+          echo "::error::Timed out waiting for MiroFish run $RUN_ID."
+          exit 1
+
+      - name: Worker logs on failure
+        if: ${{ failure() || (steps.poll.outputs.status != '' && steps.poll.outputs.status != 'completed') }}
+        shell: bash
+        run: docker logs --tail 2000 miro || true
+
+      - name: Mark an orphaned run as failed
+        if: ${{ failure() && steps.poll.outputs.status == '' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          callback_url="${SUPABASE_URL%/}/functions/v1/mirofish-notify"
+          failure_payload="$(jq -n \
+            --arg token "$MIROFISH_CALLBACK_TOKEN" \
+            --arg run_id "$RUN_ID" \
+            '{
+              token: $token,
+              runId: $run_id,
+              status: "failed",
+              progress: 100,
+              currentStage: "GitHub Actions worker failed",
+              error: "The on-demand MiroFish worker stopped before returning a terminal result."
+            }')"
+          curl --silent --show-error --fail \
+            -X POST "$callback_url" \
+            -H "Authorization: Bearer $MIROFISH_CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary "$failure_payload" >/dev/null
+
+      - name: Clean up worker resources
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/mirofish-worker-payload.json" "$RUNNER_TEMP/mirofish-run-input.json" "$RUNNER_TEMP/mirofish-worker-response.json"
+          docker rm -f miro >/dev/null 2>&1 || true
+
+      - name: Fail the workflow for a non-completed run
+        if: ${{ steps.poll.outputs.status == 'failed' || steps.poll.outputs.status == 'cancelled' }}
+        shell: bash
+        run: |
+          echo "::error::MiroFish run ended with status ${{ steps.poll.outputs.status }}."
+          exit 1
