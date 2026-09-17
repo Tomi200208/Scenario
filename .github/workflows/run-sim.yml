@@ -1,11 +1,19 @@
 name: MiroFish on-demand run
 
 on:
-  repository_dispatch:
-    types: [mirofish-run]
+  workflow_dispatch:
+    inputs:
+      scenarioPilotRunId:
+        description: Staged mirofish_runs UUID
+        required: true
+        type: string
+      projectId:
+        description: Owning project UUID
+        required: true
+        type: string
 
 concurrency:
-  group: mirofish-${{ github.event.client_payload.scenarioPilotRunId }}
+  group: mirofish-${{ inputs.scenarioPilotRunId }}
   cancel-in-progress: false
 
 permissions:
@@ -13,47 +21,52 @@ permissions:
 
 jobs:
   run:
-    if: ${{ github.event.client_payload.scenarioPilotRunId != '' }}
+    if: ${{ github.ref == 'refs/heads/main' && inputs.scenarioPilotRunId != '' }}
+    environment: mirofish
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      RUN_ID: ${{ github.event.client_payload.scenarioPilotRunId }}
-      PROJECT_ID: ${{ github.event.client_payload.projectId }}
+      RUN_ID: ${{ inputs.scenarioPilotRunId }}
+      PROJECT_ID: ${{ inputs.projectId }}
+      # Verified build 32573774120; update only after reviewing a new build.
+      WORKER_IMAGE: ghcr.io/tomi200208/scenario-worker@sha256:b3dc73f9fa081f6aa9f191001a7b69ab1e85752713065a4b4b188bc05a5b8b8c
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       MIROFISH_WORKER_TOKEN: ${{ secrets.MIROFISH_WORKER_TOKEN }}
       MIROFISH_CALLBACK_TOKEN: ${{ secrets.MIROFISH_CALLBACK_TOKEN }}
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       ZEP_API_KEY: ${{ secrets.ZEP_API_KEY }}
-      LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://api.openai.com/v1' }}
-      LLM_MODEL_NAME: ${{ vars.LLM_MODEL_NAME || 'gpt-4o-mini' }}
+      LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+      LLM_MODEL_NAME: ${{ vars.LLM_MODEL_NAME }}
       OASIS_DEFAULT_MAX_ROUNDS: ${{ vars.OASIS_DEFAULT_MAX_ROUNDS || '10' }}
 
     steps:
       - name: Validate dispatch and secrets
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
           for name in \
             SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
             MIROFISH_WORKER_TOKEN MIROFISH_CALLBACK_TOKEN \
-            LLM_API_KEY ZEP_API_KEY; do
+            LLM_API_KEY ZEP_API_KEY LLM_BASE_URL LLM_MODEL_NAME; do
             if [[ -z "${!name:-}" ]]; then
-              echo "::error::Required Actions secret $name is not configured."
+              echo "::error::Required Actions configuration $name is not configured."
               exit 1
             fi
           done
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
           if [[ ! "$RUN_ID" =~ $uuid ]] || [[ ! "$PROJECT_ID" =~ $uuid ]]; then
-            echo "::error::repository_dispatch must contain valid run and project UUIDs."
+            echo "::error::workflow_dispatch must contain valid run and project UUIDs."
             exit 1
           fi
 
       - name: Start the worker container
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
-          docker pull ghcr.io/tomi200208/scenario-worker:latest
+          docker pull "$WORKER_IMAGE"
           docker run -d --name miro -p 127.0.0.1:5001:5001 \
             -e PORT=5001 \
             -e FLASK_HOST=0.0.0.0 \
@@ -65,14 +78,14 @@ jobs:
             -e LLM_MODEL_NAME \
             -e ZEP_API_KEY \
             -e OASIS_DEFAULT_MAX_ROUNDS \
-            ghcr.io/tomi200208/scenario-worker:latest
+            "$WORKER_IMAGE"
 
       - name: Wait for the worker to be ready
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 30); do
-            if curl --silent --show-error --fail http://127.0.0.1:5001/sp/health >/dev/null; then
+          for ((attempt = 1; attempt <= 30; attempt++)); do
+            if curl --connect-timeout 2 --max-time 3 --silent --show-error --fail http://127.0.0.1:5001/sp/health >/dev/null; then
               exit 0
             fi
             if ! docker inspect --format '{{.State.Running}}' miro | grep -qx true; then
@@ -81,15 +94,16 @@ jobs:
             fi
             sleep 2
           done
-          echo "::error::MiroFish worker did not become ready within 60 seconds."
+          echo "::error::MiroFish worker did not become ready after 30 attempts."
           exit 1
 
       - name: Fetch the staged seed bundle
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
           input_file="$RUNNER_TEMP/mirofish-run-input.json"
-          curl --silent --show-error --fail-with-body --get \
+          curl --connect-timeout 10 --max-time 30 --silent --show-error --fail --get \
             "$SUPABASE_URL/rest/v1/mirofish_runs" \
             --data-urlencode "id=eq.$RUN_ID" \
             --data-urlencode "project_id=eq.$PROJECT_ID" \
@@ -120,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           response_file="$RUNNER_TEMP/mirofish-worker-response.json"
-          http_status="$(curl --silent --show-error \
+          http_status="$(curl --connect-timeout 5 --max-time 30 --silent --show-error \
             --output "$response_file" --write-out '%{http_code}' \
             -X POST http://127.0.0.1:5001/sp/runs \
             -H "Content-Type: application/json" \
@@ -134,11 +148,16 @@ jobs:
 
       - name: Wait for the run to finish
         id: poll
+        timeout-minutes: 19
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 165); do
-            if response="$(curl --silent --show-error --fail --get \
+          # 18 minutes of the 30-minute job. The rest is reserved: up to ~6.5 for
+          # startup, readiness, seed and dispatch, then the orphan update and
+          # cleanup, which must still fit after this step gives up.
+          deadline=$((SECONDS + 1080))
+          while (( SECONDS < deadline )); do
+            if response="$(curl --connect-timeout 10 --max-time 20 --silent --show-error --fail --get \
               "$SUPABASE_URL/rest/v1/mirofish_runs" \
               --data-urlencode "id=eq.$RUN_ID" \
               --data-urlencode "select=status" \
@@ -153,44 +172,70 @@ jobs:
                   ;;
               esac
             else
-              echo "Supabase status check failed; retrying ($attempt/165)."
+              echo "Supabase status check failed; retrying within the 20-minute budget."
             fi
             sleep 10
           done
           echo "::error::Timed out waiting for MiroFish run $RUN_ID."
           exit 1
 
-      - name: Worker logs on failure
+      - name: Worker state on failure (no raw logs containing project data)
         if: ${{ failure() || (steps.poll.outputs.status != '' && steps.poll.outputs.status != 'completed') }}
         shell: bash
-        run: docker logs --tail 2000 miro || true
+        run: docker inspect --format 'running={{.State.Running}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' miro || true
 
       - name: Mark an orphaned run as failed
-        if: ${{ failure() && steps.poll.outputs.status == '' }}
+        if: ${{ failure() && steps.validate.outcome == 'success' && steps.poll.outputs.status == '' }}
         continue-on-error: true
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
-          callback_url="${SUPABASE_URL%/}/functions/v1/mirofish-notify"
           failure_payload="$(jq -n \
-            --arg token "$MIROFISH_CALLBACK_TOKEN" \
-            --arg run_id "$RUN_ID" \
+            --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{
-              token: $token,
-              runId: $run_id,
               status: "failed",
               progress: 100,
-              currentStage: "GitHub Actions worker failed",
-              error: "The on-demand MiroFish worker stopped before returning a terminal result."
+              current_stage: "GitHub Actions worker failed",
+              completed_at: $completed_at,
+              error_message: "The on-demand MiroFish worker stopped before returning a terminal result."
             }')"
-          curl --silent --show-error --fail \
-            -X POST "$callback_url" \
-            -H "Authorization: Bearer $MIROFISH_CALLBACK_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data-binary "$failure_payload" >/dev/null
+          # Atomic conditional update: never overwrite a completed callback, so a
+          # retry after a transport or 5xx failure cannot clobber a run that
+          # finished in the meantime.
+          delay=2
+          for attempt in 1 2 3 4 5; do
+            http_status="$(curl --connect-timeout 5 --max-time 15 --silent --show-error \
+              --output /dev/null --write-out '%{http_code}' \
+              -X PATCH "$SUPABASE_URL/rest/v1/mirofish_runs?id=eq.$RUN_ID&project_id=eq.$PROJECT_ID&status=in.(queued,dispatching,running)" \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Content-Type: application/json" \
+              --data-binary "$failure_payload")" || http_status=000
+            case "$http_status" in
+              2*)
+                echo "Orphaned run $RUN_ID marked failed (HTTP $http_status)."
+                exit 0
+                ;;
+              408|429|5*|000)
+                echo "Orphan update attempt $attempt did not land (HTTP $http_status)."
+                ;;
+              *)
+                echo "::error::Supabase refused the orphan update with HTTP $http_status; retrying cannot help."
+                exit 1
+                ;;
+            esac
+            if (( attempt < 5 )); then
+              sleep "$delay"
+              (( delay < 8 )) && delay=$((delay * 2))
+            fi
+          done
+          echo "::error::Could not mark run $RUN_ID as failed after 5 attempts; the row may still read as active."
+          exit 1
 
       - name: Clean up worker resources
         if: ${{ always() }}
+        timeout-minutes: 2
         shell: bash
         run: |
           rm -f "$RUNNER_TEMP/mirofish-worker-payload.json" "$RUNNER_TEMP/mirofish-run-input.json" "$RUNNER_TEMP/mirofish-worker-response.json"
