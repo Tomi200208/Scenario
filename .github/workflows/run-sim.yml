@@ -84,7 +84,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 30); do
+          for ((attempt = 1; attempt <= 30; attempt++)); do
             if curl --connect-timeout 2 --max-time 3 --silent --show-error --fail http://127.0.0.1:5001/sp/health >/dev/null; then
               exit 0
             fi
