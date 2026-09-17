@@ -21,12 +21,16 @@ Only the host runner receives the Supabase service-role key, not the container.
 Seed/callback payload files have restrictive permissions and are removed during
 cleanup. Raw container logs are not published, as they may contain project data.
 
-The simulation has a 20-minute polling budget within the 30-minute job, leaving
-time for startup and cleanup. When the job fails before any terminal status, the
-orphan update retries up to five times with exponential backoff on transport,
-408, 429 and 5xx failures, and stops immediately on any other 4xx, which retrying
-cannot fix. That update is conditional on the row still being queued, dispatching
-or running, so no retry can overwrite a callback that landed meanwhile. Abrupt
+The simulation has an 18-minute polling budget within the 30-minute job. The
+remaining twelve minutes are reserved for worker startup, readiness, the seed and
+dispatch steps, and - on the failure path - the orphan update and cleanup, which
+have their own step timeouts so a stuck step cannot eat the job's last minutes.
+
+When the job fails before any terminal status, the orphan update retries up to
+five times, backing off 2s, 4s, then 8s, on transport, 408, 429 and 5xx failures,
+and gives up at once on any other 4xx, which retrying cannot fix. That update is
+conditional on the row still being queued, dispatching or running, so no retry can
+overwrite a callback that landed meanwhile. Abrupt
 runner loss/cancellation and concurrent callback idempotency still need separate
 recovery work; do not claim reliable long-running or interactive sessions from
 this batch hosting design.

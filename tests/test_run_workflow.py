@@ -37,7 +37,8 @@ class RunWorkflowTests(unittest.TestCase):
     def test_network_waits_are_bounded_and_no_paid_fallback_exists(self):
         for curl in re.findall(r"curl[^\n]+", self.workflow):
             self.assertIn("--max-time", curl)
-        self.assertIn("SECONDS + 1200", self.workflow)
+        self.assertIn("SECONDS + 1080", self.workflow)
+        self.assertIn("timeout-minutes: 19", self.workflow)
         self.assertIn("steps.validate.outcome == 'success'", self.workflow)
         self.assertNotIn("gpt-4o-mini", self.workflow)
         self.assertNotIn("api.openai.com", self.workflow)
