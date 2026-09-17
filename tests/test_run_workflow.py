@@ -25,6 +25,15 @@ class RunWorkflowTests(unittest.TestCase):
         self.assertNotIn("SUPABASE_SERVICE_ROLE_KEY", docker_run)
         self.assertNotIn("docker logs", self.workflow)
 
+    def test_orphaned_run_update_retries_a_bounded_number_of_times(self):
+        orphan = self.workflow.split("Mark an orphaned run as failed", 1)[1].split("- name:", 1)[0]
+        self.assertRegex(orphan, r"\n\s+delay=2\n")
+        loop = orphan.split("for attempt in 1 2 3 4 5; do", 1)[1].split("\n          done", 1)[0]
+        self.assertIn("-X PATCH", loop)
+        self.assertIn("status=in.(queued,dispatching,running)", loop)
+        self.assertIn("408|429|5*|000)", loop)
+        self.assertIn("delay=$((delay * 2))", loop)
+
     def test_network_waits_are_bounded_and_no_paid_fallback_exists(self):
         for curl in re.findall(r"curl[^\n]+", self.workflow):
             self.assertIn("--max-time", curl)

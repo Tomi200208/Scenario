@@ -195,13 +195,38 @@ jobs:
               completed_at: $completed_at,
               error_message: "The on-demand MiroFish worker stopped before returning a terminal result."
             }')"
-          # Atomic conditional update: never overwrite a completed callback.
-          curl --connect-timeout 10 --max-time 30 --silent --show-error --fail \
-            -X PATCH "$SUPABASE_URL/rest/v1/mirofish_runs?id=eq.$RUN_ID&project_id=eq.$PROJECT_ID&status=in.(queued,dispatching,running)" \
-            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" \
-            --data-binary "$failure_payload" >/dev/null
+          # Atomic conditional update: never overwrite a completed callback, so a
+          # retry after a transport or 5xx failure cannot clobber a run that
+          # finished in the meantime.
+          delay=2
+          for attempt in 1 2 3 4 5; do
+            http_status="$(curl --connect-timeout 10 --max-time 30 --silent --show-error \
+              --output /dev/null --write-out '%{http_code}' \
+              -X PATCH "$SUPABASE_URL/rest/v1/mirofish_runs?id=eq.$RUN_ID&project_id=eq.$PROJECT_ID&status=in.(queued,dispatching,running)" \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Content-Type: application/json" \
+              --data-binary "$failure_payload")" || http_status=000
+            case "$http_status" in
+              2*)
+                echo "Orphaned run $RUN_ID marked failed (HTTP $http_status)."
+                exit 0
+                ;;
+              408|429|5*|000)
+                echo "Orphan update attempt $attempt did not land (HTTP $http_status)."
+                ;;
+              *)
+                echo "::error::Supabase refused the orphan update with HTTP $http_status; retrying cannot help."
+                exit 1
+                ;;
+            esac
+            if (( attempt < 5 )); then
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::error::Could not mark run $RUN_ID as failed after 5 attempts; the row may still read as active."
+          exit 1
 
       - name: Clean up worker resources
         if: ${{ always() }}
